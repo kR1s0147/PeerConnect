@@ -21,6 +21,8 @@ use crossterm::{cursor,
     terminal::{Clear,ClearType},
     ExecutableCommand};
 use std::io::{stdout, Stdout, Write};  
+use tokio::time::timeout;
+use std::time::Duration;
 
 #[derive(Debug)]
 struct User{
@@ -64,9 +66,16 @@ enum StreamType {
 
 #[tokio::main]
 async fn main(){
-    // this is listen upcoming connections from other peers and recieve messages
-    let mut listener= TcpListener::bind("127.0.0.1:8010").await.unwrap();
 
+    let mut listening_addr=String::new();
+    
+    std::io::stdin().read_line(& mut listening_addr).expect("failed to read the line");
+    listening_addr=listening_addr.trim().to_string();
+    // this is listen upcoming connections from other peers and recieve messages
+    let mut listener= TcpListener::bind(format!("127.0.0.1:{}",listening_addr)).await.unwrap();
+
+
+    listening_addr=format!("127.0.0.1:{}",listening_addr).to_string();
     // connection to the server
     let mut stream= TcpStream::connect("127.0.0.1:8080").await.unwrap();
     
@@ -109,7 +118,7 @@ async fn main(){
 
 
     // this handles the login of the user. ON success it will continues to take the input from the user and parse it 
-    match handle_login(stream,&mut buf,Arc::clone(& write_handlers),s,Arc::clone(&user_name)).await{
+    match handle_login(stream,&mut buf,Arc::clone(& write_handlers),s,Arc::clone(&user_name),&listening_addr).await{
         Ok(s)=>{
             // it handles the input
             handle_input(Arc::clone(&Notifications),Arc::clone(& write_handlers)).await;
@@ -125,22 +134,33 @@ async fn handle_listener(listener:TcpListener,write_handler:WH,sender:Sender<Str
     
     // spawning new thread to accept new connections and again spawning new threads to listnen for upcoming messages from the client
     tokio::spawn(async move{
-        while let Ok((stream,_))=listener.accept().await{
-
+        while let Ok((stream,addr))=listener.accept().await{
+            if(addr.to_string() == "127.0.0.1:8080"){return ;}
             // this upgrade the stream to websocket connection
-            let ws_stream= accept_async(stream).await.expect("Error while hand shake");
+            let result= accept_async(stream).await;
+
+            let ws_stream:WebSocketStream<TcpStream>;
+            match result{
+                Ok(stream)=>{
+                    ws_stream=stream;
+                }
+                Err(e)=>{
+                    println!("{e}");
+                    return;
+                }
+            }
 
             // spliting the stream into readhalf and writehalf
             let (mut wrt,mut rd)=ws_stream.split();
 
             // reading the nest string to get name of the peer
-            let name=rd.next().await.unwrap().unwrap().to_string();
+            let name=rd.next().await.unwrap().unwrap().to_string().trim().to_string();
+
 
             // storing the name and write half of the client
             let mut write_handler=write_handler.lock().await;
-
             write_handler.insert(name.clone(),StreamType::WsSend(wrt));
-
+            
             // clonning the sender to avoid "use of moved value here"
             let sender=sender.clone();
 
@@ -194,31 +214,41 @@ async fn handle_channels(mut receiver:Receiver<String>,Notifications:NF,user_nam
         loop{
             match receiver.recv().await{
                 // it match the message 
-                Some(s)=>{
+                Some(st)=>{
+                    let res:Vec<&str>= st.split("@").collect();
+                    for s in res{
                     if s.contains(";"){
                         let  v:Vec<&str>=s.split(";").collect();
                         let mut n= Notifications.lock().await;
-                        if(v[0]=="User"){
-                           match Connect_User(& v,Arc::clone(&Notifications),Arc::clone(& user_name),sender.clone(),Arc::clone(& write_handler)).await{
-                            Ok(_)=>{}
-                            Err(e)=>{
-                                println!("Error while connecting to user");
+                        if(v[1]=="User"){
+                            if(v[2]=="Userdown"){
+                                println!("{} is not found ",v[2]);
                             }
-                           }
-                            let s=Nofication{
-                                from:v[1].to_string(),
-                                Message:v[2].to_string(),
-                            };
-                            n.push(s);
+                            else{
+                                match Connect_User(& v,Arc::clone(&Notifications),Arc::clone(& user_name),sender.clone(),Arc::clone(& write_handler)).await{
+                                    Ok(_)=>{
+                                        println!("Connected !");
+                                    }
+                                    Err(e)=>{
+                                        println!("Error while connecting to user");
+                                    }
+                                }
+                                    let s=Nofication{
+                                        from:"0".to_string(),
+                                        Message:v[2].to_string(),
+                                    };
+                                    n.push(s);
                         }
-
-                        else{   let s=Nofication{
+                    }
+                        else{   
+                            let s=Nofication{
                                 from:v[0].to_string(),
                                 Message:v[1].to_string(),
                             };
                             n.push(s);
                         }
                         }  
+                    }
                 }
                 None=>{
                     println!("No Notifications");
@@ -230,14 +260,19 @@ async fn handle_channels(mut receiver:Receiver<String>,Notifications:NF,user_nam
 
 // connect new Users
 
-async fn Connect_User(v:& Vec<&str>,n:NF,user_name:Arc<Mutex<String>>,mut sender:Sender<String>,write_handler:WH)->Result<(),tokio_tungstenite::tungstenite::Error>{
+async fn Connect_User(v:& Vec<&str>,n:NF,user_name:Arc<Mutex<String>>,mut sender:Sender<String>,write_handler:WH)->Result<(),Box<dyn std::error::Error>>{
+    let s=format!("ws://{}",v[3]);
 
-    let s=format!("ws//:{}",v[2]);
-    let (mut stream,_) = connect_async(s).await.unwrap();
+    let (mut stream,headers) =  connect_async(s).await.unwrap();
+
     let (mut wrt_stream, mut rd_stream) =stream.split();
+
     let user_name=user_name.lock().await.to_string();
     wrt_stream.send(Message::text(user_name)).await.unwrap();
-    let client_name=v[1].to_string();
+
+    let client_name=v[2].to_string();
+
+
     tokio::spawn(async move{
         let client_name=client_name;
         loop{
@@ -245,12 +280,12 @@ async fn Connect_User(v:& Vec<&str>,n:NF,user_name:Arc<Mutex<String>>,mut sender
                 Ok(m)=>{
                     match m {
                         Message::Text(s)=>{
-                            sender.send(format!("{};s",client_name)).await.unwrap();
+                            sender.send(format!("{};{}",client_name,s)).await.unwrap();
                         }
                         _=>{
                             sender.send(format!("{};invalid response",client_name)).await.unwrap();
                         }
-                    }
+                    }let s=String::new();
                 }
                 Err(e)=>{
                     sender.send(format!("{};down",client_name)).await.unwrap();
@@ -261,15 +296,12 @@ async fn Connect_User(v:& Vec<&str>,n:NF,user_name:Arc<Mutex<String>>,mut sender
     );
 
     let mut wh=write_handler.lock().await;
-    wh.insert(v[1].to_string().clone(),StreamType::WsSendTls(wrt_stream));
-
-    println!("{} is connected !",v[1]);
-    
+    wh.insert(v[2].to_string().clone(),StreamType::WsSendTls(wrt_stream));
     Ok(())
 }
 
 // it handles the login of the User
-async fn handle_login(stream:TcpStream,buf:& mut Vec<u8>,write_handler:WH,sender:Sender<String>,mut name:Arc<Mutex<String>>)-> Result<bool,std::io::Error>{
+async fn handle_login(stream:TcpStream,buf:& mut Vec<u8>,write_handler:WH,sender:Sender<String>,mut name:Arc<Mutex<String>>,listener_addr:& str)-> Result<bool,std::io::Error>{
     // input
     let mut input=String::new();
 
@@ -285,7 +317,7 @@ async fn handle_login(stream:TcpStream,buf:& mut Vec<u8>,write_handler:WH,sender
     std::io::stdin().read_line(& mut input).unwrap();
 
     // formats the input
-    let req=format!("login;{}",input.trim());
+    let req=format!("login;{};{}",input.trim(),listener_addr);
    
     // sends the login request 
     match wrt.write_all(req.as_bytes()).await{
@@ -303,11 +335,10 @@ async fn handle_login(stream:TcpStream,buf:& mut Vec<u8>,write_handler:WH,sender
     match rd.read(buf).await{
         Ok(n)=>{
             let res= String::from_utf8_lossy(&buf[..n]).to_string().trim().to_string();
-            let res=res.as_str();
-            match res{
+            let res:Vec<& str>=res.split("@").collect();
+            match res[0]{
                 // on success it spawn threads to recieve messages from the server
                 "success"=>{
-                    println!("Login Successful");
                     spawn_threads(rd, wrt,write_handler,sender).await;
                     { let mut name=name.lock().await;
                     *name=input.to_string();
@@ -318,7 +349,7 @@ async fn handle_login(stream:TcpStream,buf:& mut Vec<u8>,write_handler:WH,sender
                     println!("Username already exists");
                 }
                 _=>{
-                    println!("Invalid username");
+                    println!("Invalid username {:?}",res);
                 }
             }
               
@@ -361,7 +392,7 @@ async fn spawn_threads(mut rd:ReadHalf<TcpStream>,mut wrt: WriteHalf<TcpStream>,
 
                     // breaking if erro
                     Err(e)=>{
-                        println!("Error whilw reading from the sender");
+                        println!("Error while reading from the sender");
                         break;
                     }
                 }
@@ -379,26 +410,29 @@ async fn spawn_threads(mut rd:ReadHalf<TcpStream>,mut wrt: WriteHalf<TcpStream>,
 }
 
 // printing the starters for users
-fn print_starters(stdout: &mut Stdout){
-    stdout.execute(Clear(ClearType::All)).unwrap();
-    stdout.execute(cursor::MoveTo(0,0)).unwrap();
+fn print_starters(){
+
     println!("1:Notifications");
     println!("2:Type user name : msg to send the Message");
-    println!("3.Type get : user name to connect the address");
+    println!("3.Type get : user name to connect to the Peer");
     println!("0:Exit");
 }
 
 // handling the input
 async fn handle_input(Notifications:NF,write_handler:WH){
-    let Notifications=Notifications;
-    let write_handler=write_handler;
     let mut stdout=stdout();
     let mut input = String::new();
+    stdout.execute(Clear(ClearType::All)).unwrap();
+    stdout.execute(cursor::MoveTo(0,1)).unwrap();
+    let Notifications=Notifications;
+    let write_handler=write_handler;
+    
     loop{
-        print_starters(& mut stdout);
+        print_starters();
         std::io::stdin().read_line(& mut input).expect("failed to read the line");
         input=input.trim().to_string();
         parse_input(&input,Arc::clone(& Notifications),Arc::clone(& write_handler)).await;
+        input="".to_string();
     }
 }
 
@@ -418,7 +452,8 @@ async fn parse_input(input: & str,Notifications:NF,write_handler:WH){
                send_message(&v,write_handler).await; 
             }
             else if(input.starts_with("3")){
-
+                let v=input.split(":").collect();
+                get_User(v,write_handler).await;
             }
         }
     }
@@ -433,24 +468,62 @@ async fn print_Notifications(Notifications:NF){
 }
 
 async fn send_message(v:&Vec<& str>,write_handler:WH){
-    let write_handler=write_handler.lock().await;
+    let mut write_handler=write_handler.lock().await;
 
-    match write_handler.get(v[1]){
+    match write_handler.get_mut(v[1]){
         Some(s)=>{
             match s{
                 StreamType::TcpWrite(s)=>{
                     println!("this is server");
                 }
-                StreamType::WsSend(s)=>{
-                    s.send(Message::Text(v[2].to_string())).await.unwrap();
+                StreamType::WsSend(ref mut sink)=>{
+                   match sink.send(Message::Text(v[2].to_string())).await{
+                    Ok(s)=>{
+                        println!("success fully sent message to {}",v[1]);
+                    }
+                    Err(e)=>{
+                        println!("{} is offline",v[1]);
+                    }
+                   }
                 }   
-                StreamType::WsSendTls(s)=>{
-
+                StreamType::WsSendTls(ref mut sink)=>{
+                    match sink.send(Message::Text(v[2].to_string())).await{
+                    Ok(s)=>{
+                        println!("success fully sent message to {}",v[1]);
+                    }
+                    Err(e)=>{
+                        println!("{} is offline",v[1]);
+                    }
+                   }
                 }
             }
         }
         None=>{
             println!("{} is not found",v[1]);
+        }
+    }
+}
+
+async fn get_User(v: Vec<& str>,write_handler:WH){
+    let mut write_handler=write_handler.lock().await;
+
+    match write_handler.get_mut("0"){
+        Some(s)=>{
+            match s{
+                StreamType::TcpWrite(wrt)=>{
+                    let s=format!("getUser;{}",v[1]);
+                    match wrt.write_all(s.as_bytes()).await{
+                        Ok(_)=>{}
+                        Err(_)=>{
+                            println!("server is down");
+                        }
+                    }
+                }
+                _=>{}
+            }
+        }
+        None=>{
+
         }
     }
 }

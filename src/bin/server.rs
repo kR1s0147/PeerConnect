@@ -1,3 +1,4 @@
+use tokio::io::{ReadHalf,WriteHalf};
 use tokio::net::{TcpListener,TcpStream};
 use tokio::io::{self,AsyncReadExt,AsyncWriteExt};
 use core::fmt;
@@ -6,7 +7,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::{error, string};
 use std::{collections::HashMap, io::BufReader, sync::Arc};
 use tokio::sync::{Mutex,broadcast};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 
 type db=Arc<Mutex<HashMap<String,String>>>;
 
@@ -46,87 +47,94 @@ async fn main(){
 
     println!("Server listening on port 8080");
 
+    let mut userID=0; 
+
     while let Ok((stream,addr)) = listener.accept().await {
         println!("Connection accepted! from {:?}",addr);
         let db=Arc::clone(&Active_Users);
         let rx=tx.subscribe();
         let tx1=tx.clone();
+        userID+=1;
+        let userid=userID;
         tokio::spawn(async   move{
-        handle_connection(stream, db,rx,tx1).await;
+        handle_connection(stream, db,rx,tx1,userid).await;
         });
     }
 
 
 }
 
-async fn handle_connection( stream:TcpStream,db:db,mut rx:tokio::sync::broadcast::Receiver<String>,tx1:tokio::sync::broadcast::Sender<String> ){
-    let addr = stream.peer_addr().unwrap().to_string();
-    let mut user:User=User { name: "".to_string(), addr:addr.clone() };
-    let stream=Arc::new(Mutex::new(stream));
-    let stream2=Arc::clone(&stream);
-    tokio::spawn(async move {
-        while let Ok(s)=rx.recv().await{
-           if s=="closed"{
-            break;
-           }
-           else{
-            stream2.lock().await.write_all(s.as_bytes()).await.unwrap();
-           }
-           
-        }
-    });
-        let mut login=false;
-            
-            
+async fn handle_connection( stream:TcpStream,db:db,mut rx:tokio::sync::broadcast::Receiver<String>,tx1:tokio::sync::broadcast::Sender<String> ,userid:i32){
+    let mut user:User=User { name:String::new(), addr:String::new() };
+    let  (mut rd,mut wrt) = io::split(stream);
+    let p=userid.to_string();
+    let mut login=false;      
     let mut buf= vec![0;1024];
-    loop{
-        let mut guard = stream.lock().await;
-            // Split the TcpStream while it is locked
-            let (mut rd, mut wrt) = io::split(&mut *guard);
-        match rd.read(& mut buf).await{
+    let name=p.clone();
+    handle_recv(rx,wrt,p.clone()).await;
+    loop{ 
+       match rd.read(& mut buf).await{
             Ok(n) if n==0 =>{
                 println!("Connection closed !");
-                tx1.send("closed".to_string()).unwrap();
+                match tx1.send("closed".to_string()){
+                    Ok(_)=>{}
+                    Err(_)=>{
+                        println!("connection closed!");
+                    }
+                }
                 removeKey(& mut user, Arc::clone(&db)).await;
                 break;
             }
             Ok(n) =>{
-                let Message =String::from_utf8_lossy(& buf).to_string();
+                let Message =String::from_utf8_lossy(& buf[..n]).to_string();
+                println!("{:?}", Message);
                 let parts:Vec<&str>=Message.split(";").collect();
                 match parts[0]{
                     "login"=>{
                         if login == true{
-                            wrt.write_all("Already logged in".as_bytes()).await.unwrap();
+                            let s1= format!("{}#Already logged in@",p);
+                            tx1.send(s1).unwrap();
                             continue;
                         }
+                        let addr=parts[2].to_string();
                         match handle_login(&addr,parts,Arc::clone(&db)).await{
                             Ok(s)=>{
+                                if(login==true) {continue;}
                                 println!("User logged in :{s}");
                                 login=true;
                                 user=User{
                                     name: s.clone(),
                                     addr:addr.clone()
                                 };
-                               wrt.write_all("success".as_bytes()).await.unwrap();
-                               let s= format!("{s}:joined the chat");
+                                let s1=format!("{}#success@",p);
+                                tx1.send(s1).unwrap();
+                                let name= user.name.clone();
+                               let s= format!("{p}#{s}:joined the chat@");
                                tx1.send(s.to_string()).unwrap();
+                              
                             }
                             Err(_) =>{
                             }
                         }
                     }
                     "getUser"=>{
-                       match handle_get(parts,Arc::clone(&db)).await{
+                        println!("got get req");
+                       match handle_get(& parts,Arc::clone(&db)).await{
                         Ok(s)=>{
-                           wrt.write_all(s.as_bytes()).await.unwrap();
+                            let s1=format!("{}#{}",p,s);
+                           tx1.send(s).unwrap();
                         }
                         Err(_)=>{
-                            wrt.write_all("UserDown".as_bytes()).await.unwrap();
+                            println!("requested user is not online");   
+                            let s= format!("{}#User;Userdown;{}@",p,parts[1]);
+                            tx1.send(s).unwrap();
                         }
                        }
                     }
                     _=>{
-                        wrt.write_all("invalid request".as_bytes()).await.unwrap();
+                        println!("invalid req");
+                        let s1= format!("{}# invalid request@",p);
+                        tx1.send(s1).unwrap();
                     }
                 }
                 buf.clear();
@@ -144,6 +152,31 @@ async fn handle_connection( stream:TcpStream,db:db,mut rx:tokio::sync::broadcast
     }
 }
 
+async fn handle_recv(mut rx:tokio::sync::broadcast::Receiver<String>,mut wrt:WriteHalf<TcpStream>,name:String){
+    tokio::spawn(async move {
+        let mut name=name;
+        let login=false;
+        while let Ok(s)=rx.recv().await{
+           if s=="closed"{
+            break;
+           }
+           else{
+            if(s.contains("#")){
+                println!("{}",s);
+                let s1:Vec<& str>=s.split("#").collect();
+                if(s1[0]==name){
+                    let res=s1[1].to_string();
+                    wrt.write_all(res.as_bytes()).await.unwrap();
+                }
+            }
+            else{
+            wrt.write_all(s.as_bytes()).await.unwrap();
+            }
+           }
+           
+        }
+    });
+}
  async fn handle_login(addr:&str,parts:Vec<&str>,db:db)-> Result<String,CustomError>{
     let name=parts[1].to_string();
     let mut lock=db.lock().await;
@@ -152,8 +185,8 @@ async fn handle_connection( stream:TcpStream,db:db,mut rx:tokio::sync::broadcast
                 Err(CustomError::UserExists)
             }
             None =>{
-                let addr=format!("{:?}",addr);
-                lock.insert(name.clone(),addr);
+                lock.insert(name.clone(),addr.to_string());
+                println!("{} is inserted into db {}",name,addr);
                 Ok(name)           
             }
         }
@@ -164,39 +197,23 @@ async fn removeKey(User : & mut User,db: db){
     let name = & User.name;
     let _=db.remove(name);
 }
-async fn handle_get(parts:Vec<&str>,db:db)->Result<String,CustomError>{
+async fn handle_get(parts:&Vec<&str>,db:db)->Result<String,CustomError>{
    
-   let req = parts[1].to_string();
+   let req = parts[1].trim().to_string();
    let mut lock=db.lock().await;
    match lock.get(&req){
     Some(s)=>{
-        match check_status(&s).await{
-            Ok(_)=>{
-                let res= format!("User;{};{}",req,s);
+                let res= format!("User;{};{}@",req,s);
+                println!("get request is successfull {}",s);
                 Ok(res)
             }
-            Err(e)=>{
-                lock.remove(&req);
-                Err(CustomError::UserDown)
-            }
-        }
 
-    }
     None=>{
+        println!("user not found {}",req);
         Err(CustomError::UserIsNotOnline)
     }
+    // send user de
    }
-    // send user details
 }
 
-async fn check_status(addr:&str) -> Result<(),io::Error>{
-    match TcpStream::connect(addr).await{
-        Ok(_)=>{
-            Ok(())
-        }
-        Err(e)=>{
-            Err(e)
-        }
-    }
-}
 
